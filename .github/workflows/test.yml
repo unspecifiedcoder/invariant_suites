@@ -1,0 +1,39 @@
+name: CI
+
+permissions: {}
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build + test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Show Forge version
+        run: forge --version
+
+      - name: Build
+        run: forge build --sizes
+
+      # Excludes the two invariant contracts (ToyVaultInvariantTest +
+      # InflationInvariantTest) which fail by design — they're the
+      # invariants catching their respective planted bugs.
+      # The Hundred Finance fork test self-skips here because
+      # OPTIMISM_RPC_URL is not set in CI.
+      # Run the invariant suite locally with:
+      #     forge test --match-contract "Invariant" -vv
+      - name: Test (excluding by-design invariant catches)
+        run: forge test --no-match-contract "Invariant" -vv
